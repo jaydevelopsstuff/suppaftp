@@ -136,3 +136,21 @@ CI runs tests across 11 feature combinations in parallel with coverage via `carg
 3. `cargo clippy` passes
 4. CI green
 5. Update `CHANGELOG.md` under `PR{NUMBER}` section
+
+## Fork: positioned Tokio transfers
+
+The `resumable-transfers` branch adds `retr_as_stream_at(path, offset)` and
+`put_with_stream_at(path, offset)` to the Tokio client. They share the existing
+transfer setup, TLS, buffering and `TransferStream::finish` implementation, but
+send REST after PASV/EPSV/PORT/EPRT and directly before RETR/STOR (RFC 3659 §5.3).
+Fresh openers do not send REST. This patch does not change the sync/smol APIs.
+
+These are protocol openers, not a partial-verification API. Portable resumed
+uploads use the verified current destination length; arbitrary truncation is
+not promised. Callers must discard the client after a positioned opener fails
+or is cancelled because a restart marker or preliminary reply may remain.
+
+The loopback integration test is `crates/suppaftp/tests/tokio_restart.rs`:
+`cargo test -p suppaftp --features tokio-async-native-tls --test tokio_restart`.
+It covers passive, extended-passive and IPv4 active setup, offsets zero and
+above 8 GiB, completion/reuse, REST refusal, and CR/LF rejection before REST.

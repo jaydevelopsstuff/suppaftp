@@ -522,6 +522,33 @@ where
         Ok(stream)
     }
 
+    /// Retrieves a file starting at `offset` without downloading its prefix.
+    ///
+    /// Sends `REST` after active/passive setup, immediately before `RETR`, as
+    /// required by RFC 3659 section 5.3. Zero explicitly resets the restart marker.
+    /// Finish the returned stream with [`TransferStream::finish`].
+    ///
+    /// # Errors and cancellation
+    ///
+    /// Returns an error if setup, `REST`, or `RETR` fails. If this operation is
+    /// cancelled or fails, discard the client before another transfer: the
+    /// restart marker or a preliminary transfer reply may still be pending.
+    pub async fn retr_as_stream_at<S: AsRef<str>>(
+        &mut self,
+        file_name: S,
+        offset: usize,
+    ) -> FtpResult<TransferStream<T>> {
+        let (_, stream) = self
+            .open_transfer_at(
+                Command::Retr(file_name.as_ref().to_string()),
+                &[Status::AboutToSend, Status::AlreadyOpen],
+                Direction::Download,
+                Some(offset),
+            )
+            .await?;
+        Ok(stream)
+    }
+
     /// Removes the remote pathname from the server.
     pub async fn rmdir<S: AsRef<str>>(&mut self, pathname: S) -> FtpResult<()> {
         let mut cc = self.control().await?;
@@ -597,6 +624,35 @@ where
                 Command::Store(filename.as_ref().to_string()),
                 &[Status::AlreadyOpen, Status::AboutToSend],
                 Direction::Upload,
+            )
+            .await?;
+        Ok(stream)
+    }
+
+    /// Continues an incomplete upload using `REST` immediately followed by `STOR`.
+    ///
+    /// Active/passive setup precedes `REST`. This method does not inspect or
+    /// truncate the destination. For portable FTP restart semantics, the caller
+    /// must verify the existing partial and use its current length as `offset`
+    /// (RFC 3659 section 5.3). Zero requests a full upload. Write the remaining
+    /// payload, then call [`TransferStream::finish`] to confirm completion.
+    ///
+    /// # Errors and cancellation
+    ///
+    /// Returns an error if setup, `REST`, or `STOR` fails. If this operation is
+    /// cancelled or fails, discard the client before another transfer: the
+    /// restart marker or a preliminary transfer reply may still be pending.
+    pub async fn put_with_stream_at<S: AsRef<str>>(
+        &mut self,
+        filename: S,
+        offset: usize,
+    ) -> FtpResult<TransferStream<T>> {
+        let (_, stream) = self
+            .open_transfer_at(
+                Command::Store(filename.as_ref().to_string()),
+                &[Status::AlreadyOpen, Status::AboutToSend],
+                Direction::Upload,
+                Some(offset),
             )
             .await?;
         Ok(stream)
@@ -978,9 +1034,25 @@ where
         expected_code: &[Status],
         direction: Direction,
     ) -> FtpResult<(Response, TransferStream<T>)> {
+        self.open_transfer_at(cmd, expected_code, direction, None)
+            .await
+    }
+
+    async fn open_transfer_at(
+        &self,
+        cmd: Command,
+        expected_code: &[Status],
+        direction: Direction,
+        offset: Option<usize>,
+    ) -> FtpResult<(Response, TransferStream<T>)> {
+        // Validate before REST changes server state, including when the eventual
+        // transfer command would be rejected locally for embedded CR/LF.
+        if offset.is_some() {
+            crate::command::validate_command_line(&cmd.to_string())?;
+        }
         let mut cc = self.control().await?;
         let (response, data_stream) = self
-            .data_command_with_response(&mut cc, cmd, expected_code)
+            .data_command_with_response(&mut cc, cmd, expected_code, offset)
             .await?;
         Ok((
             response,
@@ -998,6 +1070,7 @@ where
         &self,
         cc: &mut ControlChannel<T>,
         cmd: Command,
+        offset: Option<usize>,
     ) -> FtpResult<DataStream<T>> {
         // guard data connection
         cc.guard_multiple_data_connections()?;
@@ -1005,6 +1078,10 @@ where
         let stream = match self.mode {
             Mode::Active => {
                 let listener = self.active(cc).await?;
+                if let Some(offset) = offset {
+                    cc.perform(Command::Rest(offset)).await?;
+                    cc.read_response(Status::RequestFilePending).await?;
+                }
                 cc.perform(cmd).await?;
 
                 match tokio::time::timeout(self.active_timeout, listener.accept()).await {
@@ -1023,11 +1100,19 @@ where
             }
             Mode::ExtendedPassive => {
                 let addr = self.epsv(cc).await?;
+                if let Some(offset) = offset {
+                    cc.perform(Command::Rest(offset)).await?;
+                    cc.read_response(Status::RequestFilePending).await?;
+                }
                 cc.perform(cmd).await?;
                 (self.passive_stream_builder)(addr).await?
             }
             Mode::Passive => {
                 let addr = self.pasv(cc).await?;
+                if let Some(offset) = offset {
+                    cc.perform(Command::Rest(offset)).await?;
+                    cc.read_response(Status::RequestFilePending).await?;
+                }
                 cc.perform(cmd).await?;
                 (self.passive_stream_builder)(addr).await?
             }
@@ -1067,8 +1152,9 @@ where
         cc: &mut ControlChannel<T>,
         cmd: Command,
         expected_code: &[Status],
+        offset: Option<usize>,
     ) -> FtpResult<(Response, DataStream<T>)> {
-        let data_stream = self.data_command(cc, cmd).await?;
+        let data_stream = self.data_command(cc, cmd, offset).await?;
         match cc.read_response_in(expected_code).await {
             Ok(response) => Ok((response, data_stream)),
             Err(err) => {
