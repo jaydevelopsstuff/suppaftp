@@ -204,3 +204,37 @@ fn invalid_names_are_rejected_before_setting_a_restart_marker() {
         assert_eq!(server.await.unwrap(), ["NOOP", "QUIT"]);
     });
 }
+
+#[test]
+fn control_eof_is_transport_loss_and_malformed_reply_stays_bad_response() {
+    run(async {
+        for (reply, eof) in [
+            (b"".as_slice(), true),
+            (b"200-Opening\r\n".as_slice(), true),
+            (b"oops\r\n".as_slice(), false),
+        ] {
+            let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                socket.write_all(b"220 Fixture\r\n").await.unwrap();
+                let mut reader = BufReader::new(socket);
+                let mut command = String::new();
+                reader.read_line(&mut command).await.unwrap();
+                assert_eq!(command, "NOOP\r\n");
+                reader.get_mut().write_all(reply).await.unwrap();
+            });
+            let mut client = AsyncFtpStream::connect(address).await.unwrap();
+            let error = client.noop().await.unwrap_err();
+            if eof {
+                assert!(
+                    matches!(error, FtpError::ConnectionError(ref io) if io.kind() == std::io::ErrorKind::UnexpectedEof),
+                    "{error:?}"
+                );
+            } else {
+                assert!(matches!(error, FtpError::BadResponse), "{error:?}");
+            }
+            server.await.unwrap();
+        }
+    });
+}

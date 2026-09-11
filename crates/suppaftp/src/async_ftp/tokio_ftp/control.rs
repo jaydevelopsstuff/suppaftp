@@ -122,10 +122,10 @@ where
                 .read_until(b'\n', &mut self.response_line)
                 .await
                 .map_err(FtpError::ConnectionError)?;
-            if bytes_read == 0 && !self.response_body.is_empty() {
+            if bytes_read == 0 {
                 return Err(FtpError::ConnectionError(std::io::Error::new(
                     std::io::ErrorKind::UnexpectedEof,
-                    "connection closed during multiline response",
+                    "connection closed before a complete response",
                 )));
             }
             self.response_body.extend_from_slice(&self.response_line);

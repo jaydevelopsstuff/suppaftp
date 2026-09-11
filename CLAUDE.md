@@ -154,3 +154,8 @@ The loopback integration test is `crates/suppaftp/tests/tokio_restart.rs`:
 `cargo test -p suppaftp --features tokio-async-native-tls --test tokio_restart`.
 It covers passive, extended-passive and IPv4 active setup, offsets zero and
 above 8 GiB, completion/reuse, REST refusal, and CR/LF rejection before REST.
+
+The Tokio control reader also returns the existing `ConnectionError(UnexpectedEof)`
+when the socket closes before any reply bytes arrive, as it already did for
+an unfinished multiline reply. Malformed received replies remain `BadResponse`.
+The loopback test above covers both cases; no deadline or public API changed.
