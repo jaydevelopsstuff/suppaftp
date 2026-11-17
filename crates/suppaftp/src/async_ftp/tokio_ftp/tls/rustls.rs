@@ -63,12 +63,25 @@ impl From<TlsStream<TcpStream>> for AsyncRustlsStream {
 }
 
 impl AsyncRead for AsyncRustlsStream {
+    /// Takes a peer's close without TLS's `close_notify` as the end of the stream.
+    ///
+    /// Many FTPS servers end a data connection with a bare TCP close, and rustls reports that as
+    /// a possible truncation. FTP confirms every transfer on the control connection, which stays
+    /// secured, so a listing or download cut short is still refused there; failing one the server
+    /// sent whole would only break servers that native-tls clients work with.
     fn poll_read(
         self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> std::task::Poll<std::io::Result<()>> {
-        self.project().stream.poll_read(cx, buf)
+        match self.project().stream.poll_read(cx, buf) {
+            std::task::Poll::Ready(Err(error))
+                if error.kind() == std::io::ErrorKind::UnexpectedEof =>
+            {
+                std::task::Poll::Ready(Ok(()))
+            }
+            poll => poll,
+        }
     }
 }
 
